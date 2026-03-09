@@ -110,6 +110,14 @@ def run_getpdfinfo(payload: Dict[str, Any]) -> Dict[str, Any]:
     from app.pipeline.originals.getpdfinfo11 import run_getpdfinfo as _run_getpdfinfo_original
 
     try:
-        return _run_getpdfinfo_original(normalized, normalized_names)
+        result = _run_getpdfinfo_original(normalized, normalized_names)
+        return {
+            "result_json": result.get("result_json"),
+            "logs": result.get("logs", []),
+            "apimessage": result.get("apimessage", []),
+            "company_warning": result.get("company_warning"),
+            "position_warnings": result.get("position_warnings", []),
+            "period_mapping": result.get("period_mapping", []),
+        }
     except Exception as e:
         raise RuntimeError(f"getpdfinfo11 実行失敗: {e}") from e

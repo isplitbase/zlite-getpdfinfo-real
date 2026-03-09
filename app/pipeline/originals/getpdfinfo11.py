@@ -10,21 +10,20 @@ getpdfinfo11.py (Cloud Run / API版)
 
 from __future__ import annotations
 
-import base64
 import calendar
 import json
 import os
 import shutil
 import subprocess
 import tempfile
-from dataclasses import dataclass
-from datetime import date
+from datetime import date, datetime
 from pathlib import Path
 from typing import Any, Dict, List, Tuple
 
 import boto3
 from botocore.client import Config
 from pdf2image import convert_from_path
+from zoneinfo import ZoneInfo
 
 # NOTE:
 # This repository contains a local "/app/google" stub package for old Colab helpers.
@@ -56,6 +55,17 @@ for _p in reversed(_removed_sys_path):
 
 
 MODEL = os.environ.get("GEMINI_MODEL", "gemini-2.0-flash")
+
+
+# ────────────────────────────────
+# ログユーティリティ
+# ────────────────────────────────
+def _now_hms() -> str:
+    return datetime.now(ZoneInfo("Asia/Tokyo")).strftime("%H:%M:%S")
+
+
+def _format_apimessage(msg: str) -> str:
+    return f"[{_now_hms()}] {msg}"
 
 
 # ────────────────────────────────
@@ -219,7 +229,6 @@ def build_period_mapping(all_results: list) -> list:
         except Exception:
             return ""
 
-    # ── Step1: 各PDF内で日付補完 ──
     for r in all_results:
         analysis = r["analysis"]
         periods = analysis.get("periods", [])
@@ -247,7 +256,6 @@ def build_period_mapping(all_results: list) -> list:
                 p["end_date"] = p.get("end_date") or est
                 p["detection_basis"] = "date_estimated"
 
-    # ── Step2: 全期情報収集 ──
     all_periods = []
     for r in all_results:
         filename = r["filename"]
@@ -279,7 +287,6 @@ def build_period_mapping(all_results: list) -> list:
                     "_pdf_max": pdf_max
                 })
 
-    # ── Step3: ソート（fiscal_end_date降順 → _pdf_max降順）──
     dated = [p for p in all_periods if p["fiscal_end_date"]]
     undated = [p for p in all_periods if not p["fiscal_end_date"]]
     dates_sorted = sorted(set(p["fiscal_end_date"] for p in dated), reverse=True)
@@ -289,7 +296,6 @@ def build_period_mapping(all_results: list) -> list:
         sorted_periods.extend(group)
     sorted_periods.extend(undated)
 
-    # ── Step4: 重複排除 ──
     seen = set()
     unique_periods = []
     for p in sorted_periods:
@@ -354,9 +360,6 @@ def build_final_json(all_results: list, period_mapping: list) -> dict:
     }
 
 
-# ────────────────────────────────
-# S3ユーティリティ（s3://bucket/key → ローカルにDL）
-# ────────────────────────────────
 def _parse_s3_url(url: str) -> Tuple[str, str]:
     if not url.startswith("s3://"):
         raise ValueError(f"s3:// 形式ではありません: {url}")
@@ -396,13 +399,10 @@ def download_s3_to_dir(s3_urls: List[str], out_dir: Path) -> List[Path]:
     return local_paths
 
 
-# ────────────────────────────────
-# PDF正規化（Ghostscriptがあれば使用）
-# ────────────────────────────────
 def normalize_pdf_inplace(pdf_path: Path) -> None:
     gs_exe = shutil.which("gs") or shutil.which("gswin64c.exe")
     if not gs_exe:
-        return  # Ghostscriptがない場合はスキップ（Dockerfileで入れる前提）
+        return
 
     norm_path = pdf_path.with_suffix(pdf_path.suffix + ".norm.pdf")
     cmd = [
@@ -434,10 +434,6 @@ def normalize_pdf_inplace(pdf_path: Path) -> None:
         shutil.move(str(norm_path), str(pdf_path))
 
 
-# ────────────────────────────────
-# 外部向けエントリ：files(S3 URL) -> dict
-# ────────────────────────────────
-
 def _s3_display_name_from_url(url: str) -> str:
     try:
         _, key = _parse_s3_url(url)
@@ -445,15 +441,12 @@ def _s3_display_name_from_url(url: str) -> str:
     except Exception:
         return Path(url).name or url
 
+
 def _strip_pdf_suffix(name: str) -> str:
     return name[:-4] if name.lower().endswith(".pdf") else name
 
+
 def _build_display_name_map(files: List[str], file_names: List[str] | None) -> Dict[str, str]:
-    """
-    S3保存名(拡張子なし) -> 元ファイル名(拡張子なし) の対応表を作る
-    例:
-      96-...-abc.pdf -> 元の決算書名
-    """
     mapping: Dict[str, str] = {}
     if not file_names:
         return mapping
@@ -468,10 +461,8 @@ def _build_display_name_map(files: List[str], file_names: List[str] | None) -> D
         mapping[_strip_pdf_suffix(s3_name)] = _strip_pdf_suffix(Path(original).name)
     return mapping
 
+
 def _replace_display_names_in_result(result: Dict[str, Any], display_name_map: Dict[str, str]) -> Dict[str, Any]:
-    """
-    output内の filename / source_file を S3保存名 から 元ファイル名へ置換する
-    """
     if not display_name_map:
         return result
 
@@ -508,7 +499,6 @@ def _replace_display_names_in_logs(logs: List[Dict[str, str]], display_name_map:
     if not display_name_map:
         return logs
 
-    # 長いキーを先に置換して誤置換を避ける
     items = sorted(display_name_map.items(), key=lambda kv: len(kv[0]), reverse=True)
 
     for log in logs or []:
@@ -516,11 +506,28 @@ def _replace_display_names_in_logs(logs: List[Dict[str, str]], display_name_map:
         if not isinstance(msg, str):
             continue
         for s3_name, original_name in items:
-            # 拡張子なし / .pdf付き の両方を置換
             msg = msg.replace(s3_name + ".pdf", original_name + ".pdf")
             msg = msg.replace(s3_name, original_name)
         log["msg"] = msg
     return logs
+
+
+def _replace_display_names_in_apimessages(apimessages: List[str], display_name_map: Dict[str, str]) -> List[str]:
+    if not display_name_map:
+        return apimessages
+
+    items = sorted(display_name_map.items(), key=lambda kv: len(kv[0]), reverse=True)
+    out: List[str] = []
+    for msg in apimessages or []:
+        if not isinstance(msg, str):
+            continue
+        replaced = msg
+        for s3_name, original_name in items:
+            replaced = replaced.replace(s3_name + ".pdf", original_name + ".pdf")
+            replaced = replaced.replace(s3_name, original_name)
+        out.append(replaced)
+    return out
+
 
 def run_getpdfinfo(files: List[str], file_names: List[str] | None = None) -> Dict[str, Any]:
     api_key = str(os.environ.get("GEMINI_API_KEY") or os.environ.get("GOOGLE_API_KEY") or "").strip()
@@ -533,17 +540,42 @@ def run_getpdfinfo(files: List[str], file_names: List[str] | None = None) -> Dic
     in_dir = run_dir / "input"
     in_dir.mkdir(parents=True, exist_ok=True)
 
-    pdf_paths = download_s3_to_dir(files, in_dir)
-    display_name_map = _build_display_name_map(files, file_names)
-    for p in pdf_paths:
-        normalize_pdf_inplace(p)
-
     logs: List[Dict[str, str]] = []
+    apimessages: List[str] = []
     position_warnings: List[str] = []
 
     def log(msg: str, t: str = "info"):
         logs.append({"msg": msg, "type": t})
+        apimessages.append(_format_apimessage(msg))
         print(f"[{t.upper()}] {msg}")
+
+    for url in files:
+        display_name = _s3_display_name_from_url(url)
+        try:
+            bucket, key = _parse_s3_url(url)
+            s3_client = boto3.client(
+                "s3",
+                region_name=str(os.environ.get("S3_REGION") or os.environ.get("AWS_REGION") or "ap-northeast-1").strip(),
+                aws_access_key_id=str(os.environ.get("S3_ACCESS_KEY") or os.environ.get("AWS_ACCESS_KEY_ID") or "").strip(),
+                aws_secret_access_key=str(os.environ.get("S3_SECRET_KEY") or os.environ.get("AWS_SECRET_ACCESS_KEY") or "").strip(),
+                config=Config(signature_version="s3v4"),
+            )
+            head = s3_client.head_object(Bucket=bucket, Key=key)
+            size_mb = (head.get("ContentLength", 0) or 0) / 1024 / 1024
+            log(f"📄 {display_name} を転送中... ({size_mb:.1f}MB)")
+        except Exception:
+            log(f"📄 {display_name} を転送中...")
+
+    pdf_paths = download_s3_to_dir(files, in_dir)
+    display_name_map = _build_display_name_map(files, file_names)
+
+    for p in pdf_paths:
+        size_mb = p.stat().st_size / 1024 / 1024 if p.exists() else 0.0
+        normalize_pdf_inplace(p)
+        chunks = max(1, (p.stat().st_size + (512 * 1024) - 1) // (512 * 1024)) if p.exists() else 1
+        log(f"✅ {p.name} 転送完了 ({chunks}チャンク)", "ok")
+
+    log("🚀 解析開始...")
 
     all_results = []
     for p in pdf_paths:
@@ -551,12 +583,12 @@ def run_getpdfinfo(files: List[str], file_names: List[str] | None = None) -> Dic
         filename = Path(fname).stem
         log(f"📄 {fname}: 帳票種類・期情報を解析中（PDF送信）...")
         total_pages = get_pdf_page_count(str(p))
-        log(f"   総ページ数: {total_pages}ページ")
+        log(f"総ページ数: {total_pages}ページ")
 
         analysis = analyze_pdf_with_gemini(client, str(p))
         contains = analysis.get("contains_periods", 1)
         types_found = analysis.get("types_found", [])
-        log(f"   ✅ 解析完了: {contains}期分, 帳票種類={types_found}", "ok")
+        log(f"✅ 解析完了: {contains}期分, 帳票種類={types_found}", "ok")
 
         for prd in analysis.get("periods", []):
             if prd.get("detection_basis") == "position_assumed":
@@ -579,21 +611,28 @@ def run_getpdfinfo(files: List[str], file_names: List[str] | None = None) -> Dic
     period_mapping = build_period_mapping(all_results)
     period_mapping = _replace_display_names_in_period_mapping(period_mapping, display_name_map)
     for prd in period_mapping:
-        log(f"   {prd['label']}: {prd['fiscal_end_date']} ({prd['source_file']})", "ok")
+        fiscal_end_date = prd.get("fiscal_end_date", "")
+        source_file = prd.get("source_file", "")
+        log(f"{prd['label']}: {fiscal_end_date} ({source_file})", "ok")
 
     log("📦 最終JSONを構築中...")
     final_json = build_final_json(all_results, period_mapping)
     final_json = _replace_display_names_in_result(final_json, display_name_map)
-    logs = _replace_display_names_in_logs(logs, display_name_map)
 
-    # 互換のためファイルも保存（必要なら）
     out_dir = run_dir / "output" / "json"
     out_dir.mkdir(parents=True, exist_ok=True)
-    (out_dir / "financial_data.json").write_text(json.dumps(final_json, ensure_ascii=False, indent=2), encoding="utf-8")
+    json_path = out_dir / "financial_data.json"
+    json_path.write_text(json.dumps(final_json, ensure_ascii=False, indent=2), encoding="utf-8")
+    log(f"💾 JSON保存: {json_path}", "ok")
+    log("✅ 解析完了！", "ok")
+
+    logs = _replace_display_names_in_logs(logs, display_name_map)
+    apimessages = _replace_display_names_in_apimessages(apimessages, display_name_map)
 
     return {
         "result_json": final_json,
         "logs": logs,
+        "apimessage": apimessages,
         "company_warning": company_warning,
         "position_warnings": position_warnings,
         "period_mapping": period_mapping,
