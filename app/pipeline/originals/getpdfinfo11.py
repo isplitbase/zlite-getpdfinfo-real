@@ -1,22 +1,21 @@
 """
-getpdfinfo11.py (Cloud Run / API版)
+getpdfinfo11.new.py (Cloud Run / API互換版)
 
-元のColab版 getpdfinfo11.py をベースに、HTML/UI・Colab専用I/Fを削除し、
-「PDF群 -> メタ情報JSON」を返す関数として利用できるようにした版。
-
-入力: S3 URL のリスト（s3://bucket/key）
-出力: financial_data.json 相当のdict（= build_final_json の戻り値）
+目的:
+- getpdfinfo11.py の run_getpdfinfo() と同じ入出力に寄せる
+- ただし判定ロジックは getpdfinfo11.new.py の「複数PDFを1回でGeminiへ送る」方式を使う
+- apimessage も getpdfinfo11.py と同様に記録する
+- reason を result_json に必ず含める
 """
 
 from __future__ import annotations
 
-import calendar
 import json
 import os
 import shutil
 import subprocess
 import tempfile
-from datetime import date, datetime
+from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Tuple
 
@@ -69,297 +68,237 @@ def _format_apimessage(msg: str) -> str:
 
 
 # ────────────────────────────────
+# Geminiプロンプト
+# ────────────────────────────────
+def build_meta_prompt(pdf_infos: list) -> str:
+    """
+    pdf_infos = [
+      {"index": 1, "file_name": "A.pdf"},
+      {"index": 2, "file_name": "B.pdf"},
+      ...
+    ]
+    """
+    file_list_text = "\n".join(
+        [f"- PDF{p['index']} = {p['file_name']}" for p in pdf_infos]
+    )
+
+    return f"""
+あなたは日本の決算書を読み取る専門家です。
+
+これから複数のPDFが送られます。
+各PDFには番号とファイル名があります。
+必ずその対応関係を守って判定してください。
+
+PDF一覧:
+{file_list_text}
+
+目的:
+各PDFが「今期」「前期」「前々期」「前々期の前期」のどれに該当するか判定してください。
+
+特別パターンサンプル1：
+　1枚目PDF（pdf1.pdf）：[N]年度と[N+1]年度の情報が含まれている
+　2枚目PDF（pdf2.pdf）：[N+2]年度と[N+3]度の情報が含まれている
+　の場合
+　1枚目PDF（pdf1.pdf）：「前々期」/「前々期の前期」
+　2枚目PDF（pdf2.pdf）：「今期」/「前期」
+
+特別パターンサンプル2：
+　1枚目PDF（pdf1.pdf）：令和6年9月の貸借対照表と損益計算書が含まれている
+　2枚目PDF（pdf2.pdf）：令和6年12月の貸借対照表と損益計算書が含まれている
+　3枚目PDF（pdf3.pdf）：令和7年9月の貸借対照表と損益計算書が含まれている
+　の場合
+　1枚目PDF（pdf1.pdf）：「前々期」
+　2枚目PDF（pdf2.pdf）：「前期」
+　3枚目PDF（pdf3.pdf）：「今期」
+
+特別パターンサンプル3：
+　1枚目PDF（pdf1.pdf）：令和6年1月の貸借対照表と損益計算書が含まれている
+　2枚目PDF（pdf2.pdf）：令和6年9月の貸借対照表と損益計算書が含まれている
+　3枚目PDF（pdf3.pdf）：令和7年9月の貸借対照表と損益計算書が含まれている
+　の場合
+　1枚目PDF（pdf1.pdf）：「前々期」
+　2枚目PDF（pdf2.pdf）：「前期」
+　3枚目PDF（pdf3.pdf）：「今期」
+
+「プロンプトの特別パターンサンプルはあくまで形式を教えるためのものであり、日付などの事実は必ずPDF内の記載から抽出すること」
+
+重要ルール:
+- 各PDFは同じ企業の決算書です。
+- 各PDFは複数期を含む可能性があります。
+- 販売費及び一般管理費の資料を見ないでください。
+- たな卸資産の資料を見ないでください。
+- 製造原価の資料を見ないでください。
+- ファイル数は1且つ1年度の情報しかないの場合、必ず今期になる。
+- その場合は、そのPDFに含まれる期ラベルをすべて列挙してください。
+- PDF番号とファイル名を取り違えないでください。
+- 出力は必ずJSONのみを返してください。説明文やMarkdownは不要です。
+- 決算情報がある年度をすべて出してください。
+- 「今期」「前期」「前々期」「前々期の前期」をすべてのPDFをトータル見て判断してください
+- すべてのPDFの中の最新決算期間は「今期」です
+- ラベルは必ず次の4種類のみを使ってください: ["今期", "前期", "前々期", "前々期の前期"]
+- 必ず各PDFごとに reason を返してください
+- reason には、どの年度・決算年月・相対比較によりそのラベルになったかを簡潔に書いてください
+- 順番は、送信されたPDF順（PDF1, PDF2, PDF3, ...）で返してください。
+
+出力JSON形式:
+{{
+  "results": [
+    {{
+      "pdf_index": 1,
+      "file_name": "A.pdf",
+      "labels": ["今期"],
+      "reason": "令和7年9月期が全PDF中で最新のため今期",
+      "年度": ["令和7年度"]
+    }},
+    {{
+      "pdf_index": 2,
+      "file_name": "B.pdf",
+      "labels": ["前期"],
+      "reason": "令和6年9月期で、全PDF中の最新期の1期前に当たるため前期",
+      "年度": ["令和6年度"]
+    }}
+  ]
+}}
+""".strip()
+
+
+# ────────────────────────────────
 # Gemini API: JSON抽出ヘルパー（リトライ付き）
 # ────────────────────────────────
-def _call_gemini_json(client: genai.Client, contents: list, max_tokens: int = 2000) -> dict:
-    """Gemini APIを呼び出してJSONを返す共通関数（リトライ付き）"""
+def _extract_json_text(text: str) -> str:
+    text = text.strip()
+    if "```json" in text:
+        text = text.split("```json", 1)[1].split("```", 1)[0].strip()
+    elif "```" in text:
+        text = text.split("```", 1)[1].split("```", 1)[0].strip()
+    return text
+
+
+def _call_gemini_json(client: genai.Client, contents: list, max_tokens: int = 4000) -> dict:
     import time as _time
 
     MAX_RETRIES = 3
     last_err = None
+
     for attempt in range(MAX_RETRIES):
         try:
             response = client.models.generate_content(
                 model=MODEL,
                 contents=contents,
                 config=genai_types.GenerateContentConfig(
-                    max_output_tokens=max_tokens,
                     temperature=0.0,
+                    max_output_tokens=max_tokens,
                     response_mime_type="application/json",
                 ),
             )
+
             text = None
             try:
                 text = response.text
             except Exception:
                 pass
+
             if not text:
                 try:
                     text = response.candidates[0].content.parts[0].text
                 except Exception:
                     pass
-            if not text:
-                raise ValueError(f"Gemini APIから有効なレスポンスが得られませんでした: {response}")
 
-            text = text.strip()
-            if "```json" in text:
-                text = text.split("```json")[1].split("```")[0].strip()
-            elif "```" in text:
-                text = text.split("```")[1].split("```")[0].strip()
-            return json.loads(text)
+            if not text:
+                raise ValueError("Gemini APIレスポンス取得失敗")
+
+            text = _extract_json_text(text)
+            data = json.loads(text)
+
+            if not isinstance(data, dict):
+                raise ValueError("GeminiのJSON応答がdictではありません")
+
+            if "results" not in data or not isinstance(data["results"], list):
+                raise ValueError("GeminiのJSON応答に results がありません")
+
+            return data
 
         except Exception as e:
             last_err = e
-            wait = 2 ** attempt  # 1s, 2s, 4s
-            print(f"[WARN] Gemini API エラー (試行{attempt+1}/{MAX_RETRIES}): {e} → {wait}秒後リトライ")
+            wait = 2 ** attempt
+            print(f"[WARN] Gemini API retry {attempt + 1}/{MAX_RETRIES}: {e}")
             _time.sleep(wait)
 
     raise RuntimeError(f"Gemini API {MAX_RETRIES}回失敗: {last_err}")
 
 
 # ────────────────────────────────
-# Step1用プロンプト: メタ情報のみ取得
+# PDFまとめ解析
 # ────────────────────────────────
-META_PROMPT = """
-あなたは日本の決算書を読み取る専門家です。
-このPDFのメタ情報のみをJSONで返してください。金額の抽出は不要です。
-
-## 出力JSON形式
-```json
-{
-  "company_name": "会社名（不明な場合は空文字）",
-  "contains_periods": 1または2または3,
-  "periods": [
-    {
-      "physical_column_position": "left/center/right/single",
-      "column_header": "列ヘッダー文字列",
-      "fiscal_end_date": "YYYY-MM-DD",
-      "start_date": "YYYY-MM-DD",
-      "end_date": "YYYY-MM-DD",
-      "fiscal_period_name": "第XX期",
-      "detection_basis": "date_comparison/column_label/period_label/position_assumed"
-    }
-  ],
-  "types_found": ["BS","PL","販管費","製造原価"],
-  "target_pages": {
-    "BS": [2],
-    "PL": [3],
-    "販管費": [4],
-    "製造原価": [5]
-  }
-}
-```
-
-## 帳票種類の判定ルール（最重要）
-
-### 販管費の判定
-- **「販売費及び一般管理費内訳」「販管費明細」など、販管費の明細のみが独立して掲載されているページ**を「販管費」と判定する
-- 損益計算書（PL）の中に「販売費及び一般管理費」の合計金額や内訳が含まれていても、それは「PL」のページであり「販管費」ではない
-- 「販管費」と判定するのは、販管費の明細だけが独立したページ・帳票として存在する場合のみ
-
-### 判定の誤りの例（禁止）
-- PLページ（p3〜p5）の中に販売費及び一般管理費の行があるだけで、販管費のtarget_pagesにそのページを含めてはならない
-- 誤り例: PL=[3,4,5], 販管費=[4] → p4はPLの続きであり独立した販管費明細ではない
-
-### 各帳票の判定基準
-- **BS（貸借対照表）**: 資産・負債・純資産が掲載されているページ
-- **PL（損益計算書）**: 売上高・営業利益・経常利益・当期純利益などが掲載されているページ（販管費の行がPL内にあってもPLとして判定）
-- **販管費**: 販売費及び一般管理費の**明細のみ**が独立して掲載されているページ（PLとは別の独立したページ・帳票）
-- **製造原価**: 製造原価明細書が独立して掲載されているページ
-
-## その他のルール
-- periods: 各列の年月日ヘッダーを比較し最新日付=today側として判定
-- 1期PDFの場合: physical_column_positionは"single"
-- types_found: BS/PL/販管費/製造原価/その他 の5種類のみ（存在しない種類は含めない）
-- target_pages: 各帳票が掲載されているページ番号（1始まり）のリスト
-- JSONのみ返してください。説明文は不要です。
-"""
-
-
-def analyze_pdf_with_gemini(client: genai.Client, pdf_path: str) -> dict:
-    """Gemini APIでPDFを解析（メタ情報取得のみ）"""
-    pdf_bytes = Path(pdf_path).read_bytes()
-    contents = [
-        genai_types.Part(
-            inline_data=genai_types.Blob(mime_type="application/pdf", data=pdf_bytes)
-        ),
-        META_PROMPT,
-    ]
-    return _call_gemini_json(client, contents, max_tokens=2000)
-
-
-def get_pdf_page_count(pdf_path: str) -> int:
-    pages = convert_from_path(pdf_path, dpi=72)
-    return len(pages)
-
-
-def check_company_consistency(results: list) -> tuple:
-    names = [r["analysis"].get("company_name", "") for r in results]
-    names_clean = [n.replace("株式会社", "").replace("有限会社", "").replace(" ", "").replace("　", "") for n in names]
-    unique = list(set([n for n in names_clean if n]))
-    if len(unique) <= 1:
-        return True, names
-    for i in range(len(unique)):
-        for j in range(len(unique)):
-            if i != j and (unique[i] in unique[j] or unique[j] in unique[i]):
-                return True, names
-    return False, names
-
-
-def build_period_mapping(all_results: list) -> list:
+def analyze_multiple_pdfs_with_gemini(client: genai.Client, pdf_paths: list, file_names: list) -> dict:
     """
-    全PDFの期情報を収集し、決算年月日で降順ソート。
-    最新3期に今期/前期/前々期ラベルを割り当てる。
-
-    【日付補完】
-    fiscal_end_dateがNullの列は、contains_periodsと列位置から年数を計算して補完する。
-    例）2期構成: left=1年前、right=0年前
-
-    【重複排除優先順位】
-    同じfiscal_end_dateが複数PDFに存在する場合、
-    より新しい今期日付を持つPDF（_pdf_max降順）を優先する。
+    すべてのPDFをまとめて1回でGeminiへ送る。
+    PDF番号・ファイル名を明示することで、どのPDFがどの判定かを安定化する。
     """
+    if len(pdf_paths) != len(file_names):
+        raise ValueError("pdf_paths と file_names の数が一致しません")
 
-    def _estimate_prev_date(date_str: str, years_back: int) -> str:
-        try:
-            d = date.fromisoformat(date_str)
-            prev_year = d.year - years_back
-            last_day = calendar.monthrange(prev_year, d.month)[1]
-            return d.replace(year=prev_year, day=min(d.day, last_day)).isoformat()
-        except Exception:
-            return ""
-
-    for r in all_results:
-        analysis = r["analysis"]
-        periods = analysis.get("periods", [])
-        contains = analysis.get("contains_periods", 1)
-        dated = sorted([p for p in periods if p.get("fiscal_end_date")], key=lambda p: p["fiscal_end_date"], reverse=True)
-        if not dated:
-            continue
-        newest_date = dated[0]["fiscal_end_date"]
-
-        if contains == 1:
-            pos_to_years = {"single": 0}
-        elif contains == 2:
-            pos_to_years = {"right": 0, "left": 1}
-        else:
-            pos_to_years = {"right": 0, "center": 1, "left": 2}
-
-        for p in [p for p in periods if not p.get("fiscal_end_date")]:
-            pos = p.get("physical_column_position", "left")
-            years_back = pos_to_years.get(pos, 1)
-            if years_back == 0:
-                continue
-            est = _estimate_prev_date(newest_date, years_back)
-            if est:
-                p["fiscal_end_date"] = est
-                p["end_date"] = p.get("end_date") or est
-                p["detection_basis"] = "date_estimated"
-
-    all_periods = []
-    for r in all_results:
-        filename = r["filename"]
-        analysis = r["analysis"]
-        periods = analysis.get("periods", [])
-        pdf_max = max((p.get("fiscal_end_date") or "" for p in periods), default="")
-
-        if not periods:
-            contains = analysis.get("contains_periods", 1)
-            cols = (["single"] if contains == 1 else ["left", "right"] if contains == 2 else ["left", "center", "right"])[:contains]
-            for col in cols:
-                all_periods.append({
-                    "fiscal_end_date": "", "start_date": "", "end_date": "",
-                    "fiscal_period_name": "", "source_file": filename,
-                    "column_header": "", "physical_column_position": col,
-                    "detection_basis": "fallback_no_date", "_pdf_max": pdf_max
-                })
-        else:
-            for p in periods:
-                all_periods.append({
-                    "fiscal_end_date": p.get("fiscal_end_date") or "",
-                    "start_date": p.get("start_date") or "",
-                    "end_date": p.get("end_date") or "",
-                    "fiscal_period_name": p.get("fiscal_period_name") or "",
-                    "source_file": filename,
-                    "column_header": p.get("column_header") or "",
-                    "physical_column_position": p.get("physical_column_position") or "right",
-                    "detection_basis": p.get("detection_basis") or "position_assumed",
-                    "_pdf_max": pdf_max
-                })
-
-    dated = [p for p in all_periods if p["fiscal_end_date"]]
-    undated = [p for p in all_periods if not p["fiscal_end_date"]]
-    dates_sorted = sorted(set(p["fiscal_end_date"] for p in dated), reverse=True)
-    sorted_periods = []
-    for d in dates_sorted:
-        group = sorted([p for p in dated if p["fiscal_end_date"] == d], key=lambda p: p.get("_pdf_max", ""), reverse=True)
-        sorted_periods.extend(group)
-    sorted_periods.extend(undated)
-
-    seen = set()
-    unique_periods = []
-    for p in sorted_periods:
-        key = p["fiscal_end_date"] or (p["source_file"] + "_" + p["physical_column_position"])
-        if key not in seen:
-            seen.add(key)
-            unique_periods.append({k: v for k, v in p.items() if not k.startswith("_")})
-
-    labels = ["今期", "前期", "前々期"]
-    for i, p in enumerate(unique_periods[:3]):
-        p["label"] = labels[i]
-    return unique_periods[:3]
-
-
-def build_final_json(all_results: list, period_mapping: list) -> dict:
-    pdf_info = []
-    for r in all_results:
-        analysis = r["analysis"]
-        periods_with_label = []
-        for p in analysis.get("periods", []):
-            end_date = p.get("fiscal_end_date", "")
-            assigned = next(
-                (
-                    pm["label"]
-                    for pm in period_mapping
-                    if pm["fiscal_end_date"] == end_date and pm["source_file"] == r["filename"]
-                ),
-                "",
-            )
-            pp = dict(p)
-            pp["assigned_label"] = assigned
-            periods_with_label.append(pp)
-
-        pdf_info.append({
-            "filename": r["filename"],
-            "total_pages": r["total_pages"],
-            "contains_periods": analysis.get("contains_periods", 1),
-            "periods": periods_with_label,
-            "target_pages": analysis.get("target_pages", {}),
-            "types_found": analysis.get("types_found", []),
+    pdf_infos = []
+    for i, file_name in enumerate(file_names, start=1):
+        pdf_infos.append({
+            "index": i,
+            "file_name": file_name,
         })
 
-    company_name = all_results[0]["analysis"].get("company_name", "") if all_results else ""
-    return {
-        "metadata": {
-            "company_name": company_name,
-            "fiscal_periods": [
-                {
-                    "label": p["label"],
-                    "fiscal_period_name": p.get("fiscal_period_name", ""),
-                    "fiscal_end_date": p["fiscal_end_date"],
-                    "start_date": p["start_date"],
-                    "end_date": p["end_date"],
-                    "source_file": p["source_file"],
-                    "column_header": p.get("column_header", ""),
-                    "detection_basis": p.get("detection_basis", ""),
-                }
-                for p in period_mapping
-            ],
-        },
-        "pdf_info": pdf_info,
-    }
+    prompt = build_meta_prompt(pdf_infos)
+    contents = [prompt]
+
+    for i, pdf_path in enumerate(pdf_paths, start=1):
+        file_name = file_names[i - 1]
+        contents.append(f"以下が PDF{i} / ファイル名: {file_name} です。")
+
+        with open(pdf_path, "rb") as f:
+            pdf_bytes = f.read()
+
+        contents.append(
+            genai_types.Part(
+                inline_data=genai_types.Blob(
+                    mime_type="application/pdf",
+                    data=pdf_bytes,
+                )
+            )
+        )
+
+    result = _call_gemini_json(client, contents)
+
+    results = result.get("results", [])
+    results = sorted(results, key=lambda x: x.get("pdf_index", 9999))
+    result["results"] = results
+    return result
 
 
+# ────────────────────────────────
+# 表示用
+# ────────────────────────────────
+def build_display_text(result_json: dict) -> str:
+    lines = []
+    for item in result_json.get("results", []):
+        pdf_index = item.get("pdf_index", "")
+        file_name = item.get("file_name", "")
+        labels = item.get("labels", [])
+        reason = item.get("reason", "")
+
+        if not isinstance(labels, list):
+            labels = [str(labels)]
+
+        label_text = " / ".join([str(x) for x in labels]) if labels else "不明"
+
+        lines.append(f"{pdf_index}枚目PDF（{file_name}）：{label_text}")
+        if reason:
+            lines.append(f"  理由: {reason}")
+        lines.append("")
+
+    return "\n".join(lines).strip()
+
+
+# ────────────────────────────────
+# S3 / ファイル補助
+# ────────────────────────────────
 def _parse_s3_url(url: str) -> Tuple[str, str]:
     if not url.startswith("s3://"):
         raise ValueError(f"s3:// 形式ではありません: {url}")
@@ -434,6 +373,11 @@ def normalize_pdf_inplace(pdf_path: Path) -> None:
         shutil.move(str(norm_path), str(pdf_path))
 
 
+def get_pdf_page_count(pdf_path: str) -> int:
+    pages = convert_from_path(pdf_path, dpi=72)
+    return len(pages)
+
+
 def _s3_display_name_from_url(url: str) -> str:
     try:
         _, key = _parse_s3_url(url)
@@ -462,36 +406,35 @@ def _build_display_name_map(files: List[str], file_names: List[str] | None) -> D
     return mapping
 
 
-def _replace_display_names_in_result(result: Dict[str, Any], display_name_map: Dict[str, str]) -> Dict[str, Any]:
+def _replace_display_names_in_results(result_json: Dict[str, Any], display_name_map: Dict[str, str]) -> Dict[str, Any]:
     if not display_name_map:
-        return result
+        return result_json
 
-    metadata = result.get("metadata", {})
-    for p in metadata.get("fiscal_periods", []) or []:
-        sf = p.get("source_file")
-        if isinstance(sf, str) and sf in display_name_map:
-            p["source_file"] = display_name_map[sf]
+    for item in result_json.get("results", []) or []:
+        file_name = item.get("file_name")
+        if not isinstance(file_name, str):
+            continue
 
-    for info in result.get("pdf_info", []) or []:
-        fn = info.get("filename")
-        if isinstance(fn, str) and fn in display_name_map:
-            info["filename"] = display_name_map[fn]
+        stem = _strip_pdf_suffix(file_name)
+        if stem in display_name_map:
+            item["file_name"] = display_name_map[stem] + ".pdf"
 
-        for p in info.get("periods", []) or []:
-            sf = p.get("source_file")
-            if isinstance(sf, str) and sf in display_name_map:
-                p["source_file"] = display_name_map[sf]
-
-    return result
+    return result_json
 
 
 def _replace_display_names_in_period_mapping(period_mapping: List[Dict[str, Any]], display_name_map: Dict[str, str]) -> List[Dict[str, Any]]:
     if not display_name_map:
         return period_mapping
-    for p in period_mapping or []:
-        sf = p.get("source_file")
-        if isinstance(sf, str) and sf in display_name_map:
-            p["source_file"] = display_name_map[sf]
+
+    for item in period_mapping or []:
+        file_name = item.get("file_name")
+        if not isinstance(file_name, str):
+            continue
+
+        stem = _strip_pdf_suffix(file_name)
+        if stem in display_name_map:
+            item["file_name"] = display_name_map[stem] + ".pdf"
+
     return period_mapping
 
 
@@ -529,16 +472,142 @@ def _replace_display_names_in_apimessages(apimessages: List[str], display_name_m
     return out
 
 
+# ────────────────────────────────
+# result_json の補助生成
+# ────────────────────────────────
+def _normalize_years_field(year_value: Any) -> List[str]:
+    if year_value is None:
+        return []
+    if isinstance(year_value, list):
+        return [str(x).strip() for x in year_value if str(x).strip()]
+    s = str(year_value).strip()
+    return [s] if s else []
+
+
+def _normalize_labels_field(label_value: Any) -> List[str]:
+    if label_value is None:
+        return []
+    if isinstance(label_value, list):
+        return [str(x).strip() for x in label_value if str(x).strip()]
+    s = str(label_value).strip()
+    return [s] if s else []
+
+
+def _extract_latest_year_int(item: Dict[str, Any]) -> int | None:
+    import re
+
+    years_raw = item.get("年度", "")
+    candidates = years_raw if isinstance(years_raw, list) else [years_raw]
+
+    nums = []
+    for y in candidates:
+        if not y:
+            continue
+        s = str(y)
+        found = re.findall(r"\d+", s)
+        for n in found:
+            try:
+                nums.append(int(n))
+            except Exception:
+                pass
+
+    return max(nums) if nums else None
+
+
+def _apply_two_file_gap_rule(result_json: Dict[str, Any]) -> None:
+    """
+    2ファイルのみで、最新年度差が2年の場合は古い側を1段古く補正する。
+      前期   -> 前々期
+      前々期 -> 前々期の前期
+    """
+    results = result_json.get("results", [])
+    if len(results) != 2:
+        return
+
+    year1 = _extract_latest_year_int(results[0])
+    year2 = _extract_latest_year_int(results[1])
+
+    if year1 is None or year2 is None:
+        return
+
+    if abs(year1 - year2) != 2:
+        return
+
+    older_item = results[0] if year1 < year2 else results[1]
+    labels = _normalize_labels_field(older_item.get("labels", []))
+
+    replaced_labels = []
+    for label in labels:
+        if label == "前期":
+            replaced_labels.append("前々期")
+        elif label == "前々期":
+            replaced_labels.append("前々期の前期")
+        else:
+            replaced_labels.append(label)
+
+    older_item["labels"] = replaced_labels
+
+    reason = str(older_item.get("reason", "") or "").strip()
+    extra = "2ファイル構成で最新年度差が2年のため、古いPDF側のラベルを1段古い期へ補正"
+    older_item["reason"] = f"{reason} / {extra}" if reason else extra
+
+
+def build_period_mapping_from_result(result_json: Dict[str, Any]) -> List[Dict[str, Any]]:
+    """
+    旧 getpdfinfo11.py の戻り値に含まれていた period_mapping 互換の簡易版。
+    """
+    period_mapping: List[Dict[str, Any]] = []
+
+    for item in result_json.get("results", []) or []:
+        file_name = item.get("file_name", "")
+        labels = _normalize_labels_field(item.get("labels", []))
+        years = _normalize_years_field(item.get("年度", []))
+        reason = str(item.get("reason", "") or "")
+
+        for i, label in enumerate(labels):
+            year_text = years[i] if i < len(years) else (years[0] if years else "")
+            period_mapping.append({
+                "label": label,
+                "fiscal_end_date": "",
+                "start_date": "",
+                "end_date": "",
+                "fiscal_period_name": year_text,
+                "file_name": file_name,
+                "column_header": "",
+                "detection_basis": "gemini_total_judgement",
+                "reason": reason,
+            })
+
+    return period_mapping
+
+
+# ────────────────────────────────
+# メイン
+# ────────────────────────────────
 def run_getpdfinfo(files: List[str], file_names: List[str] | None = None) -> Dict[str, Any]:
+    """
+    旧 getpdfinfo11.py 互換の戻り値:
+    {
+        "result_json": ...,
+        "display_text": ...,
+        "logs": ...,
+        "apimessage": ...,
+        "company_warning": None,
+        "position_warnings": [],
+        "period_mapping": ...
+    }
+    """
     api_key = str(os.environ.get("GEMINI_API_KEY") or os.environ.get("GOOGLE_API_KEY") or "").strip()
     if not api_key:
         raise ValueError("Gemini APIキーが未指定です。環境変数 GEMINI_API_KEY を指定してください。")
 
     client = genai.Client(api_key=api_key)
 
-    run_dir = Path(tempfile.mkdtemp(prefix="zlite_getpdfinfo_", dir="/tmp"))
+    run_dir = Path(tempfile.mkdtemp(prefix="zlite_getpdfinfo_new_", dir="/tmp"))
     in_dir = run_dir / "input"
+    out_dir = run_dir / "output" / "json"
     in_dir.mkdir(parents=True, exist_ok=True)
+    out_dir.mkdir(parents=True, exist_ok=True)
 
     logs: List[Dict[str, str]] = []
     apimessages: List[str] = []
@@ -548,7 +617,26 @@ def run_getpdfinfo(files: List[str], file_names: List[str] | None = None) -> Dic
         logs.append({"msg": msg, "type": t})
         apimessages.append(_format_apimessage(msg))
         print(f"[{t.upper()}] {msg}")
+    def _apply_single_file_two_year_labels_rule(result_json: Dict[str, Any]) -> None:
+        """
+        アップロードファイルが1件だけで、そのPDFに年度が2要素ある場合は
+        labels を ["今期", "前期"] に補正する。
+        """
+        results = result_json.get("results", [])
+        if len(results) != 1:
+            return
 
+        item = results[0]
+        years = _normalize_years_field(item.get("年度", []))
+
+        if len(years) != 2:
+            return
+
+        item["labels"] = ["今期", "前期"]
+
+        reason = str(item.get("reason", "") or "").strip()
+        extra = "アップロードファイルが1件のみで、同一PDF内に年度が2要素あるため、labels を『今期』『前期』に補正"
+        item["reason"] = f"{reason} / {extra}" if reason else extra
     for url in files:
         display_name = _s3_display_name_from_url(url)
         try:
@@ -569,71 +657,56 @@ def run_getpdfinfo(files: List[str], file_names: List[str] | None = None) -> Dic
     pdf_paths = download_s3_to_dir(files, in_dir)
     display_name_map = _build_display_name_map(files, file_names)
 
+    actual_file_names: List[str] = []
     for p in pdf_paths:
-        size_mb = p.stat().st_size / 1024 / 1024 if p.exists() else 0.0
         normalize_pdf_inplace(p)
         chunks = max(1, (p.stat().st_size + (512 * 1024) - 1) // (512 * 1024)) if p.exists() else 1
         log(f"✅ {p.name} 転送完了 ({chunks}チャンク)", "ok")
+        actual_file_names.append(p.name)
+
+    # file_names が指定されていれば優先、なければ実ファイル名
+    send_file_names = [
+        Path(file_names[i]).name if file_names and i < len(file_names) and file_names[i] else actual_file_names[i]
+        for i in range(len(actual_file_names))
+    ]
 
     log("🚀 解析開始...")
+    log("📨 Geminiへ全PDFを一括送信します")
 
-    all_results = []
-    for p in pdf_paths:
-        fname = p.name
-        filename = Path(fname).stem
-        log(f"📄 {fname}: 帳票種類・期情報を解析中（PDF送信）...")
-        total_pages = get_pdf_page_count(str(p))
-        log(f"総ページ数: {total_pages}ページ")
+    result_json = analyze_multiple_pdfs_with_gemini(client, [str(p) for p in pdf_paths], send_file_names)
 
-        analysis = analyze_pdf_with_gemini(client, str(p))
-        contains = analysis.get("contains_periods", 1)
-        types_found = analysis.get("types_found", [])
-        log(f"✅ 解析完了: {contains}期分, 帳票種類={types_found}", "ok")
+    # フィールド正規化
+    for item in result_json.get("results", []) or []:
+        item["labels"] = _normalize_labels_field(item.get("labels", []))
+        item["年度"] = _normalize_years_field(item.get("年度", []))
+        item["reason"] = str(item.get("reason", "") or "").strip()
 
-        for prd in analysis.get("periods", []):
-            if prd.get("detection_basis") == "position_assumed":
-                position_warnings.append(f"{filename}: 列順序を位置から推定しました")
-
-        all_results.append({
-            "filename": filename,
-            "pdf_path": str(p),
-            "total_pages": total_pages,
-            "analysis": analysis,
-        })
-
-    is_same, names = check_company_consistency(all_results)
-    company_warning = None
-    if not is_same:
-        company_warning = f"異なる会社のPDFが含まれている可能性があります: {names}"
-        log(f"⚠️ {company_warning}", "warn")
-
-    log("🔗 期ラベルのマッピングを構築中...")
-    period_mapping = build_period_mapping(all_results)
+    _apply_two_file_gap_rule(result_json)
+    _apply_single_file_two_year_labels_rule(result_json)
+    result_json = _replace_display_names_in_results(result_json, display_name_map)
+    display_text = build_display_text(result_json)
+    period_mapping = build_period_mapping_from_result(result_json)
     period_mapping = _replace_display_names_in_period_mapping(period_mapping, display_name_map)
-    for prd in period_mapping:
-        fiscal_end_date = prd.get("fiscal_end_date", "")
-        source_file = prd.get("source_file", "")
-        log(f"{prd['label']}: {fiscal_end_date} ({source_file})", "ok")
 
-    log("📦 最終JSONを構築中...")
-    final_json = build_final_json(all_results, period_mapping)
-    final_json = _replace_display_names_in_result(final_json, display_name_map)
+    json_path = out_dir / "period_result.json"
+    txt_path = out_dir / "period_result.txt"
 
-    out_dir = run_dir / "output" / "json"
-    out_dir.mkdir(parents=True, exist_ok=True)
-    json_path = out_dir / "financial_data.json"
-    json_path.write_text(json.dumps(final_json, ensure_ascii=False, indent=2), encoding="utf-8")
+    json_path.write_text(json.dumps(result_json, ensure_ascii=False, indent=2), encoding="utf-8")
+    txt_path.write_text(display_text, encoding="utf-8")
+
     log(f"💾 JSON保存: {json_path}", "ok")
+    log(f"💾 TEXT保存: {txt_path}", "ok")
     log("✅ 解析完了！", "ok")
 
     logs = _replace_display_names_in_logs(logs, display_name_map)
     apimessages = _replace_display_names_in_apimessages(apimessages, display_name_map)
 
     return {
-        "result_json": final_json,
+        "result_json": result_json,
+        "display_text": display_text,
         "logs": logs,
         "apimessage": apimessages,
-        "company_warning": company_warning,
+        "company_warning": None,
         "position_warnings": position_warnings,
         "period_mapping": period_mapping,
     }
