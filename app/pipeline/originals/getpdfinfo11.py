@@ -694,8 +694,6 @@ def run_getpdfinfo(files: List[str], file_names: List[str] | None = None) -> Dic
     json_path.write_text(json.dumps(result_json, ensure_ascii=False, indent=2), encoding="utf-8")
     txt_path.write_text(display_text, encoding="utf-8")
 
-    log(f"💾 JSON保存: {json_path}", "ok")
-    log(f"💾 TEXT保存: {txt_path}", "ok")
     log("✅ 解析完了！", "ok")
 
     logs = _replace_display_names_in_logs(logs, display_name_map)
