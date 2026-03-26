@@ -368,7 +368,13 @@ def normalize_pdf_inplace(pdf_path: Path) -> None:
         f"-sOutputFile={str(norm_path)}",
         str(pdf_path),
     ]
-    proc = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    proc = subprocess.run(
+        cmd,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=False,   # ここを変更
+    )
+
     if proc.returncode == 0 and norm_path.exists():
         shutil.move(str(norm_path), str(pdf_path))
 
