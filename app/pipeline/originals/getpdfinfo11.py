@@ -53,7 +53,7 @@ for _p in reversed(_removed_sys_path):
         sys.path.insert(0, _p)
 
 
-MODEL = os.environ.get("GEMINI_MODEL", "gemini-2.5-pro")
+MODEL = os.environ.get("GEMINI_MODEL", "gemini-2.5-flash")
 
 
 # ────────────────────────────────
