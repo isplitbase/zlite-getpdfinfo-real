@@ -24,36 +24,12 @@ from botocore.client import Config
 from pdf2image import convert_from_path
 from zoneinfo import ZoneInfo
 
-# NOTE:
-# This repository contains a local "/app/google" stub package for old Colab helpers.
-# It shadows the real "google-genai" package on Cloud Run, so we must import
-# google.genai only after temporarily removing the project root from sys.path.
-import importlib
-import sys
+import base64
+from io import BytesIO
 
-_PROJECT_ROOT = str(Path(__file__).resolve().parents[3])
-_removed_sys_path = []
-for _p in list(sys.path):
-    if _p in ("", _PROJECT_ROOT, "/app"):
-        _removed_sys_path.append(_p)
-        try:
-            sys.path.remove(_p)
-        except ValueError:
-            pass
+from openai import OpenAI
 
-_google_mod = sys.modules.get("google")
-if _google_mod is not None and str(getattr(_google_mod, "__file__", "")).startswith(_PROJECT_ROOT + "/google"):
-    del sys.modules["google"]
-
-genai = importlib.import_module("google.genai")
-genai_types = importlib.import_module("google.genai.types")
-
-for _p in reversed(_removed_sys_path):
-    if _p not in sys.path:
-        sys.path.insert(0, _p)
-
-
-MODEL = os.environ.get("GEMINI_MODEL", "gemini-2.5-flash")
+MODEL = "gpt-4.1-mini"
 
 
 # ────────────────────────────────
@@ -163,7 +139,7 @@ PDF一覧:
 
 
 # ────────────────────────────────
-# Gemini API: JSON抽出ヘルパー（リトライ付き）
+# OpenAI API: JSON抽出ヘルパー（リトライ付き）
 # ────────────────────────────────
 def _extract_json_text(text: str) -> str:
     text = text.strip()
@@ -174,69 +150,52 @@ def _extract_json_text(text: str) -> str:
     return text
 
 
-def _call_gemini_json(client: genai.Client, contents: list, max_tokens: int = 4000) -> dict:
+def _call_openai_json(client: OpenAI, messages: list, max_tokens: int = 4000) -> dict:
     import time as _time
 
-    MAX_RETRIES = 5
+    MAX_RETRIES = 3
     last_err = None
 
     for attempt in range(MAX_RETRIES):
         try:
-            response = client.models.generate_content(
+            response = client.chat.completions.create(
                 model=MODEL,
-                contents=contents,
-                config=genai_types.GenerateContentConfig(
-                    temperature=0.0,
-                    max_output_tokens=max_tokens,
-                    response_mime_type="application/json",
-                ),
+                messages=messages,
+                response_format={"type": "json_object"},
+                max_tokens=max_tokens,
+                temperature=0.0,
             )
 
-            text = None
-            try:
-                text = response.text
-            except Exception:
-                pass
-
+            text = response.choices[0].message.content
             if not text:
-                try:
-                    text = response.candidates[0].content.parts[0].text
-                except Exception:
-                    pass
-
-            if not text:
-                raise ValueError("Gemini APIレスポンス取得失敗")
+                raise ValueError("OpenAI APIレスポンス取得失敗")
 
             text = _extract_json_text(text)
             data = json.loads(text)
 
             if not isinstance(data, dict):
-                raise ValueError("GeminiのJSON応答がdictではありません")
+                raise ValueError("OpenAIのJSON応答がdictではありません")
 
             if "results" not in data or not isinstance(data["results"], list):
-                raise ValueError("GeminiのJSON応答に results がありません")
+                raise ValueError("OpenAIのJSON応答に results がありません")
 
             return data
 
         except Exception as e:
             last_err = e
-            if "429" in str(e) or "RESOURCE_EXHAUSTED" in str(e):
-                wait = 60
-                print(f"[WARN] Gemini API 429 rate limit, {wait}秒待機後リトライ ({attempt + 1}/{MAX_RETRIES}): {e}")
-            else:
-                wait = 2 ** attempt
-                print(f"[WARN] Gemini API retry {attempt + 1}/{MAX_RETRIES}: {e}")
+            wait = 60
+            print(f"[WARN] OpenAI API retry {attempt + 1}/{MAX_RETRIES}, {wait}秒待機: {e}")
             _time.sleep(wait)
 
-    raise RuntimeError(f"Gemini API {MAX_RETRIES}回失敗: {last_err}")
+    raise RuntimeError(f"OpenAI API {MAX_RETRIES}回失敗: {last_err}")
 
 
 # ────────────────────────────────
 # PDFまとめ解析
 # ────────────────────────────────
-def analyze_multiple_pdfs_with_gemini(client: genai.Client, pdf_paths: list, file_names: list) -> dict:
+def analyze_multiple_pdfs_with_openai(client: OpenAI, pdf_paths: list, file_names: list) -> dict:
     """
-    すべてのPDFをまとめて1回でGeminiへ送る。
+    すべてのPDFをそのまま（base64）1回でOpenAIへ送る。
     PDF番号・ファイル名を明示することで、どのPDFがどの判定かを安定化する。
     """
     if len(pdf_paths) != len(file_names):
@@ -250,25 +209,25 @@ def analyze_multiple_pdfs_with_gemini(client: genai.Client, pdf_paths: list, fil
         })
 
     prompt = build_meta_prompt(pdf_infos)
-    contents = [prompt]
+    content: list = [{"type": "text", "text": prompt}]
 
     for i, pdf_path in enumerate(pdf_paths, start=1):
         file_name = file_names[i - 1]
-        contents.append(f"以下が PDF{i} / ファイル名: {file_name} です。")
+        content.append({"type": "text", "text": f"以下が PDF{i} / ファイル名: {file_name} です。"})
 
         with open(pdf_path, "rb") as f:
-            pdf_bytes = f.read()
+            b64 = base64.b64encode(f.read()).decode("utf-8")
 
-        contents.append(
-            genai_types.Part(
-                inline_data=genai_types.Blob(
-                    mime_type="application/pdf",
-                    data=pdf_bytes,
-                )
-            )
-        )
+        content.append({
+            "type": "file",
+            "file": {
+                "filename": file_name,
+                "file_data": f"data:application/pdf;base64,{b64}",
+            },
+        })
 
-    result = _call_gemini_json(client, contents)
+    messages = [{"role": "user", "content": content}]
+    result = _call_openai_json(client, messages)
 
     results = result.get("results", [])
     results = sorted(results, key=lambda x: x.get("pdf_index", 9999))
@@ -583,7 +542,7 @@ def build_period_mapping_from_result(result_json: Dict[str, Any]) -> List[Dict[s
                 "fiscal_period_name": year_text,
                 "file_name": file_name,
                 "column_header": "",
-                "detection_basis": "gemini_total_judgement",
+                "detection_basis": "openai_total_judgement",
                 "reason": reason,
             })
 
@@ -606,11 +565,11 @@ def run_getpdfinfo(files: List[str], file_names: List[str] | None = None) -> Dic
         "period_mapping": ...
     }
     """
-    api_key = str(os.environ.get("GEMINI_API_KEY") or os.environ.get("GOOGLE_API_KEY") or "").strip()
+    api_key = str(os.environ.get("OPENAI_API_KEY") or "").strip()
     if not api_key:
-        raise ValueError("Gemini APIキーが未指定です。環境変数 GEMINI_API_KEY を指定してください。")
+        raise ValueError("OpenAI APIキーが未指定です。環境変数 OPENAI_API_KEY を指定してください。")
 
-    client = genai.Client(api_key=api_key)
+    client = OpenAI(api_key=api_key)
 
     run_dir = Path(tempfile.mkdtemp(prefix="zlite_getpdfinfo_new_", dir="/tmp"))
     in_dir = run_dir / "input"
@@ -680,9 +639,15 @@ def run_getpdfinfo(files: List[str], file_names: List[str] | None = None) -> Dic
     ]
 
     log("🚀 解析開始...")
-    log("📨 Geminiへ全PDFを一括送信します")
+    log("📨 OpenAIへ全PDFを一括送信します（PDF直接送信モード）")
 
-    result_json = analyze_multiple_pdfs_with_gemini(client, [str(p) for p in pdf_paths], send_file_names)
+    try:
+        result_json = analyze_multiple_pdfs_with_openai(client, [str(p) for p in pdf_paths], send_file_names)
+    except Exception as e:
+        err_msg = f"OpenAI API 呼び出し失敗: {e}"
+        log(f"❌ {err_msg}", "error")
+        print(f"[ERROR] {err_msg}", flush=True)
+        raise RuntimeError(err_msg) from e
 
     # フィールド正規化
     for item in result_json.get("results", []) or []:
