@@ -177,7 +177,7 @@ def _extract_json_text(text: str) -> str:
 def _call_gemini_json(client: genai.Client, contents: list, max_tokens: int = 4000) -> dict:
     import time as _time
 
-    MAX_RETRIES = 3
+    MAX_RETRIES = 5
     last_err = None
 
     for attempt in range(MAX_RETRIES):
@@ -220,8 +220,12 @@ def _call_gemini_json(client: genai.Client, contents: list, max_tokens: int = 40
 
         except Exception as e:
             last_err = e
-            wait = 2 ** attempt
-            print(f"[WARN] Gemini API retry {attempt + 1}/{MAX_RETRIES}: {e}")
+            if "429" in str(e) or "RESOURCE_EXHAUSTED" in str(e):
+                wait = 60
+                print(f"[WARN] Gemini API 429 rate limit, {wait}秒待機後リトライ ({attempt + 1}/{MAX_RETRIES}): {e}")
+            else:
+                wait = 2 ** attempt
+                print(f"[WARN] Gemini API retry {attempt + 1}/{MAX_RETRIES}: {e}")
             _time.sleep(wait)
 
     raise RuntimeError(f"Gemini API {MAX_RETRIES}回失敗: {last_err}")
